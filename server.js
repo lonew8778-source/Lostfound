@@ -19,17 +19,23 @@ const database = require("./database");
 const app = express();
 const PORT = 3000;
 
+if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 64) {
+  throw new Error("SESSION_SECRET is missing or too short in .env");
+}
+
+app.set("trust proxy", 1);
 app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: "10kb" }));
 app.use(session({
-  secret: "493471bca0c16da5eb22b7e16920de95445817ee489e143ff5e014e970983a94",
+  name: "connect.sid",
+  secret: process.env.SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
     sameSite: "strict",
-    secure: false,
+    secure: "auto",
     maxAge: 1000 * 60 * 60 * 24
   }
 }));
@@ -198,7 +204,75 @@ await mailTransporter.sendMail({
   }
 });
 
-const loginAttempts=new Map();const MAX_LOGIN_ATTEMPTS=5;const LOGIN_LOCK_MS=900000;function loginBlocked(k){const r=loginAttempts.get(k);if(!r)return false;if(r.lockedUntil&&Date.now()<r.lockedUntil)return true;if(r.lockedUntil)loginAttempts.delete(k);return false;}function loginFailed(k){const r=loginAttempts.get(k)||{count:0};r.count++;if(r.count>=MAX_LOGIN_ATTEMPTS)r.lockedUntil=Date.now()+LOGIN_LOCK_MS;loginAttempts.set(k,r);}function loginSucceeded(k){loginAttempts.delete(k);}
+const loginAttempts = new Map();
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
+
+function loginBlocked(key) {
+  const record = loginAttempts.get(key);
+  if (!record) return false;
+
+  if (record.lockedUntil && Date.now() < record.lockedUntil) {
+    return true;
+  }
+
+  if (record.lockedUntil && Date.now() >= record.lockedUntil) {
+    loginAttempts.delete(key);
+  }
+
+  return false;
+}
+
+function loginFailed(key) {
+  const now = Date.now();
+  const record = loginAttempts.get(key) || {
+    count: 0,
+    lastAttempt: now
+  };
+
+  record.count++;
+  record.lastAttempt = now;
+
+  if (record.count >= MAX_LOGIN_ATTEMPTS) {
+    record.lockedUntil = now + LOGIN_LOCK_MS;
+  }
+
+  loginAttempts.set(key, record);
+
+  if (loginAttempts.size > 10000) {
+    const cutoff = now - LOGIN_LOCK_MS;
+    for (const [storedKey, storedRecord] of loginAttempts) {
+      if (
+        !storedRecord.lockedUntil ||
+        storedRecord.lockedUntil <= now ||
+        storedRecord.lastAttempt < cutoff
+      ) {
+        loginAttempts.delete(storedKey);
+      }
+    }
+  }
+}
+
+function loginSucceeded(key) {
+  loginAttempts.delete(key);
+}
+
+const loginAttemptsCleanup = setInterval(() => {
+  const now = Date.now();
+
+  for (const [key, record] of loginAttempts) {
+    if (
+      !record.lockedUntil ||
+      record.lockedUntil <= now
+    ) {
+      loginAttempts.delete(key);
+    }
+  }
+}, 5 * 60 * 1000);
+
+if (typeof loginAttemptsCleanup.unref === "function") {
+  loginAttemptsCleanup.unref();
+}
 app.post("/api/login", async (req, res) => {
   try {
     const email = String(req.body.email || "").trim().toLowerCase();
@@ -228,20 +302,87 @@ app.post("/api/login", async (req, res) => {
     }
 
     loginSucceeded(loginKey);
-    req.session.userId = user.id;
-    res.json({
-      message: "تم تسجيل الدخول",
-      user: {
-        id: user.id,
-        email: user.email
+
+    req.session.regenerate((sessionError) => {
+      if (sessionError) {
+        console.error("Session regeneration error:", sessionError);
+        return res.status(500).json({ error: "تعذر إنشاء جلسة آمنة" });
       }
+
+      req.session.userId = user.id;
+
+      req.session.save((saveError) => {
+        if (saveError) {
+          console.error("Session save error:", saveError);
+          return res.status(500).json({ error: "تعذر حفظ جلسة الدخول" });
+        }
+
+        return res.json({
+          message: "تم تسجيل الدخول",
+          user: {
+            id: user.id,
+            email: user.email
+          }
+        });
+      });
     });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "تعذر تسجيل الدخول" });
   }
 });
-app.post("/api/resend-verification", async (req, res) => {
+
+const verificationRateLimits = new Map();
+
+function createIpRateLimiter(maxRequests, windowMs, message) {
+  const attempts = new Map();
+
+  const cleanup = setInterval(() => {
+    const now = Date.now();
+    for (const [key, record] of attempts) {
+      if (now - record.start >= windowMs) attempts.delete(key);
+    }
+  }, Math.min(windowMs, 60000));
+
+  if (typeof cleanup.unref === "function") cleanup.unref();
+
+  return function rateLimitByIp(req, res, next) {
+    const key = String(req.ip || "unknown");
+    const now = Date.now();
+    let record = attempts.get(key);
+
+    if (!record || now - record.start >= windowMs) {
+      record = { start: now, count: 0 };
+    }
+
+    if (record.count >= maxRequests) {
+      const retryAfter = Math.max(
+        1,
+        Math.ceil((windowMs - (now - record.start)) / 1000)
+      );
+      res.set("Retry-After", String(retryAfter));
+      return res.status(429).json({ error: message });
+    }
+
+    record.count++;
+    attempts.set(key, record);
+    next();
+  };
+}
+
+const limitResendVerification = createIpRateLimiter(
+  3,
+  15 * 60 * 1000,
+  "تجاوزت الحد المسموح لإعادة إرسال الرمز. حاول بعد 15 دقيقة."
+);
+
+const limitVerifyEmail = createIpRateLimiter(
+  10,
+  15 * 60 * 1000,
+  "تجاوزت عدد محاولات التحقق. حاول بعد 15 دقيقة."
+);
+
+app.post("/api/resend-verification", limitResendVerification, async (req, res) => {
   try {
     const userId = String(req.body.userId || "").trim();
 
@@ -280,7 +421,7 @@ app.post("/api/resend-verification", async (req, res) => {
   }
 });
 
-app.post("/api/verify-email", (req, res) => {
+app.post("/api/verify-email", limitVerifyEmail, (req, res) => {
   const userId = String(req.body.userId || "").trim();
   const token = String(req.body.token || "").trim();
 

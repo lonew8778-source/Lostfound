@@ -19,3 +19,4 @@ backup-before-full-cleanup/
 public/*.bak
 public/*.bak2
 public/*.bak3
+backups/
